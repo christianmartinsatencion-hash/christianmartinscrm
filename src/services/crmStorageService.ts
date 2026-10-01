@@ -1,15 +1,50 @@
 import { Customer, Deal, Task } from '../types/crm';
 import { supabase, isSupabaseConfigured } from '../lib/supabase';
-import { DealRow, DealInsert } from '../types/supabase';
+import { DealRow, DealInsert, TaskRow, TaskInsert } from '../types/supabase';
 import { isValidUUID, generateSecureId } from '../lib/analytics';
 
 const STORAGE_KEY_CUSTOMERS = 'cm_crm_customers_v2';
 const STORAGE_KEY_DEALS = 'cm_crm_deals_v2';
 const STORAGE_KEY_TASKS = 'cm_crm_tasks_v2';
+const STORAGE_KEY_TASKS_ID_MAP = 'cm_crm_tasks_id_map';
 
 export const INITIAL_CUSTOMERS: Customer[] = [];
 export const INITIAL_DEALS: Deal[] = [];
 export const INITIAL_TASKS: Task[] = [];
+
+// Helper para converter registro do Supabase (TaskRow) em modelo do Frontend (Task)
+export const mapTaskRowToTask = (row: TaskRow): Task => ({
+  id: row.id,
+  title: row.title,
+  dueDate: row.due_date || new Date().toISOString().split('T')[0],
+  completed: row.completed,
+  priority: row.priority || 'medium',
+  leadId: row.lead_id || null,
+  dealId: row.deal_id || null,
+  userId: row.user_id,
+  createdAt: row.created_at,
+  updatedAt: row.updated_at,
+});
+
+// Helper para obter ou gerar um UUID persistente e consistente para IDs de tarefas locais
+export const getOrCreateTaskIdMapping = (localId: string): string => {
+  if (isValidUUID(localId)) {
+    return localId;
+  }
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY_TASKS_ID_MAP);
+    const map: Record<string, string> = saved ? JSON.parse(saved) : {};
+    if (map[localId] && isValidUUID(map[localId])) {
+      return map[localId];
+    }
+    const newUuid = generateSecureId();
+    map[localId] = newUuid;
+    localStorage.setItem(STORAGE_KEY_TASKS_ID_MAP, JSON.stringify(map));
+    return newUuid;
+  } catch {
+    return generateSecureId();
+  }
+};
 
 // Helper para converter registro do Supabase (DealRow) em modelo do Frontend (Deal)
 export const mapDealRowToDeal = (row: DealRow): Deal => ({
@@ -519,7 +554,7 @@ export const crmStorage = {
     return { totalLocal: localDeals.length, migrated: successCount, failed: failCount };
   },
 
-  // Carrega Tarefas
+  // Carrega Tarefas do LocalStorage (Fallback / Cache)
   loadTasks(): Task[] {
     try {
       const saved = localStorage.getItem(STORAGE_KEY_TASKS);
@@ -541,6 +576,233 @@ export const crmStorage = {
     } catch {
       // ignore
     }
+  },
+
+  // Busca Tarefas diretamente do Supabase para o usuário autenticado com fallback para LocalStorage
+  async fetchSupabaseTasks(): Promise<Task[]> {
+    if (!isSupabaseConfigured()) {
+      return this.loadTasks();
+    }
+
+    try {
+      const { data: authData } = await supabase.auth.getSession();
+      if (!authData.session) {
+        return this.loadTasks();
+      }
+
+      const { data, error } = await supabase
+        .from('tasks')
+        .select('*')
+        .order('created_at', { ascending: false });
+
+      if (error) {
+        console.error('❌ [Supabase fetchSupabaseTasks Error]:', error.message);
+      } else if (data) {
+        const remoteTasks = data.map(mapTaskRowToTask);
+        this.saveTasks(remoteTasks);
+        return remoteTasks;
+      }
+    } catch (err) {
+      console.warn('⚠️ [Supabase Tasks Fetch Warning]: Servidor indisponível, usando cache local.', err);
+    }
+
+    return this.loadTasks();
+  },
+
+  // Persiste uma Tarefa no Supabase e atualiza o LocalStorage
+  async saveTaskToSupabase(task: Task): Promise<{ success: boolean; data?: Task; error?: any }> {
+    const validUuid = getOrCreateTaskIdMapping(task.id);
+    task.id = validUuid;
+
+    // Atualiza cache local imediatamente para UI responsiva
+    const currentLocal = this.loadTasks();
+    const updatedLocal = [task, ...currentLocal.filter((t) => t.id !== task.id)];
+    this.saveTasks(updatedLocal);
+
+    if (!isSupabaseConfigured()) {
+      return { success: false, error: 'Supabase não configurado' };
+    }
+
+    const { data: authData } = await supabase.auth.getSession();
+    if (!authData.session) {
+      return { success: false, error: 'Usuário não autenticado' };
+    }
+
+    try {
+      const payload: TaskInsert = {
+        id: validUuid,
+        user_id: authData.session.user.id,
+        title: task.title.trim() || 'Nova Tarefa',
+        due_date: (task.dueDate && task.dueDate.trim()) ? task.dueDate.trim() : null,
+        completed: task.completed ?? false,
+        priority: task.priority || 'medium',
+        lead_id: task.leadId && isValidUUID(task.leadId) ? task.leadId : null,
+        deal_id: task.dealId && isValidUUID(task.dealId) ? task.dealId : null,
+      };
+
+      if (task.createdAt && !isNaN(Date.parse(task.createdAt))) {
+        payload.created_at = new Date(task.createdAt).toISOString();
+      }
+
+      const { data, error } = await supabase
+        .from('tasks')
+        .upsert(payload)
+        .select()
+        .single();
+
+      if (error) {
+        console.error(`[TASKS] Erro ao enviar tarefa ${validUuid}:`, error.message);
+        return { success: false, error };
+      } else if (data) {
+        const mapped = mapTaskRowToTask(data);
+        const freshList = this.loadTasks().map((t) => (t.id === mapped.id ? mapped : t));
+        this.saveTasks(freshList);
+        return { success: true, data: mapped };
+      }
+    } catch (err: any) {
+      console.error(`[TASKS] Erro ao enviar tarefa ${validUuid}:`, err?.message || err);
+      return { success: false, error: err };
+    }
+
+    return { success: false, error: 'Erro desconhecido' };
+  },
+
+  // Alterna a conclusão de uma Tarefa no Supabase e atualiza o LocalStorage
+  async toggleTaskInSupabase(taskId: string, completed: boolean): Promise<void> {
+    const currentLocal = this.loadTasks();
+    const updatedLocal = currentLocal.map((t) =>
+      t.id === taskId ? { ...t, completed, updatedAt: new Date().toISOString() } : t
+    );
+    this.saveTasks(updatedLocal);
+
+    if (!isSupabaseConfigured()) return;
+
+    const { data: authData } = await supabase.auth.getSession();
+    if (!authData.session) return;
+
+    try {
+      const { error } = await supabase
+        .from('tasks')
+        .update({
+          completed,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', taskId);
+
+      if (error) {
+        console.error('❌ [Supabase toggleTaskInSupabase Error]:', error.message);
+      }
+    } catch (err) {
+      console.error('❌ [Supabase toggleTaskInSupabase Exception]:', err);
+    }
+  },
+
+  // Exclui uma Tarefa do Supabase e atualiza o LocalStorage apenas se confirmado ou offline
+  async deleteTaskFromSupabase(taskId: string): Promise<boolean> {
+    if (!isSupabaseConfigured()) {
+      const currentLocal = this.loadTasks();
+      this.saveTasks(currentLocal.filter((t) => t.id !== taskId));
+      return true;
+    }
+
+    const { data: authData } = await supabase.auth.getSession();
+    if (!authData.session) {
+      const currentLocal = this.loadTasks();
+      this.saveTasks(currentLocal.filter((t) => t.id !== taskId));
+      return true;
+    }
+
+    try {
+      const { error } = await supabase.from('tasks').delete().eq('id', taskId);
+      if (error) {
+        console.error('❌ [Supabase deleteTaskFromSupabase Error]:', error.message);
+        return false;
+      }
+
+      const currentLocal = this.loadTasks();
+      this.saveTasks(currentLocal.filter((t) => t.id !== taskId));
+      return true;
+    } catch (err) {
+      console.error('❌ [Supabase deleteTaskFromSupabase Exception]:', err);
+      return false;
+    }
+  },
+
+  // Migra tarefas locais ativas para o Supabase sem sobrescrever tarefas remotas existentes
+  async migrateLocalTasksToSupabase(): Promise<{ totalLocal: number; inserted: number; alreadyExisting: number; failed: number }> {
+    const stats = { totalLocal: 0, inserted: 0, alreadyExisting: 0, failed: 0 };
+
+    if (!isSupabaseConfigured()) return stats;
+
+    const { data: authData } = await supabase.auth.getSession();
+    if (!authData.session) return stats;
+
+    const userId = authData.session.user.id;
+    const localTasks = this.loadTasks();
+    stats.totalLocal = localTasks.length;
+
+    if (localTasks.length === 0) return stats;
+
+    // Busca IDs das tarefas já salvas no Supabase para proteção contra sobrescrita
+    const existingRemoteIds = new Set<string>();
+    try {
+      const { data: remoteData } = await supabase.from('tasks').select('id');
+      if (remoteData) {
+        remoteData.forEach((r) => existingRemoteIds.add(r.id));
+      }
+    } catch {
+      // ignore
+    }
+
+    const updatedLocalTasks: Task[] = [];
+
+    for (const task of localTasks) {
+      const targetUuid = getOrCreateTaskIdMapping(task.id);
+      const normalizedTask = { ...task, id: targetUuid, userId };
+      updatedLocalTasks.push(normalizedTask);
+
+      if (existingRemoteIds.has(targetUuid)) {
+        stats.alreadyExisting++;
+        continue;
+      }
+
+      try {
+        const payload: TaskInsert = {
+          id: targetUuid,
+          user_id: userId,
+          title: task.title || 'Tarefa Importada',
+          due_date: (task.dueDate && task.dueDate.trim()) ? task.dueDate.trim() : null,
+          completed: task.completed ?? false,
+          priority: task.priority || 'medium',
+          lead_id: task.leadId && isValidUUID(task.leadId) ? task.leadId : null,
+          deal_id: task.dealId && isValidUUID(task.dealId) ? task.dealId : null,
+        };
+
+        if (task.createdAt && !isNaN(Date.parse(task.createdAt))) {
+          payload.created_at = new Date(task.createdAt).toISOString();
+        }
+
+        const { error } = await supabase.from('tasks').insert(payload);
+
+        if (!error) {
+          stats.inserted++;
+          existingRemoteIds.add(targetUuid);
+        } else {
+          stats.failed++;
+        }
+      } catch {
+        stats.failed++;
+      }
+    }
+
+    this.saveTasks(updatedLocalTasks);
+    try {
+      localStorage.setItem('cm_crm_tasks_migrated_v1', 'true');
+    } catch {
+      // ignore
+    }
+
+    return stats;
   },
 
   // Sincroniza Leads do Servidor (/api/leads) e do Supabase com a lista do CRM

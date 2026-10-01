@@ -15,6 +15,7 @@ import { SupabaseAuthProvider, useSupabaseAuth } from './context/SupabaseAuthCon
 import { AdminLoginScreen } from './components/auth/AdminLoginScreen';
 import { Loader2 } from 'lucide-react';
 import { crmStorage, subscribeToRealtimeLeads, subscribeToRealtimeDeals } from './services/crmStorageService';
+import { generateSecureId } from './lib/analytics';
 
 export type AppSection = 'public' | 'crm';
 
@@ -27,7 +28,7 @@ function InternalCRMApp({ onBackToPublicSite }: { onBackToPublicSite?: () => voi
   const [deals, setDeals] = useState<Deal[]>(() => crmStorage.loadDeals());
   const [tasks, setTasks] = useState<Task[]>(() => crmStorage.loadTasks());
 
-  // Salva automaticamente sempre que houver alterações no CRM
+  // Salva automaticamente no LocalStorage como cache de primeira camada
   useEffect(() => {
     crmStorage.saveCustomers(customers);
   }, [customers]);
@@ -67,10 +68,27 @@ function InternalCRMApp({ onBackToPublicSite }: { onBackToPublicSite?: () => voi
     });
   }, []);
 
+  // Sincroniza Tarefas vindas do Supabase
+  const refreshTasks = React.useCallback(() => {
+    const local = crmStorage.loadTasks();
+    setTasks(local);
+
+    crmStorage.fetchSupabaseTasks().then((supabaseTasks) => {
+      if (supabaseTasks.length > 0) {
+        setTasks(supabaseTasks);
+      }
+    });
+  }, []);
+
   useEffect(() => {
     // Executa a migração segura dos Deals do LocalStorage para o Supabase
     crmStorage.migrateLocalDealsToSupabase().then(() => {
       refreshLeads();
+    });
+
+    // Executa a migração segura das Tasks do LocalStorage para o Supabase
+    crmStorage.migrateLocalTasksToSupabase().then(() => {
+      refreshTasks();
     });
 
     const unsubscribeRealtimeLeads = subscribeToRealtimeLeads((freshLeads) => {
@@ -84,18 +102,20 @@ function InternalCRMApp({ onBackToPublicSite }: { onBackToPublicSite?: () => voi
     const handleLeadSubmitted = () => {
       setCustomers(crmStorage.loadCustomers());
       crmStorage.fetchSupabaseDeals().then(setDeals);
-      setTasks(crmStorage.loadTasks());
+      crmStorage.fetchSupabaseTasks().then(setTasks);
     };
 
     window.addEventListener('focus', refreshLeads);
+    window.addEventListener('focus', refreshTasks);
     window.addEventListener('cm_lead_submitted', handleLeadSubmitted);
     return () => {
       unsubscribeRealtimeLeads();
       unsubscribeRealtimeDeals();
       window.removeEventListener('focus', refreshLeads);
+      window.removeEventListener('focus', refreshTasks);
       window.removeEventListener('cm_lead_submitted', handleLeadSubmitted);
     };
-  }, [refreshLeads, user]);
+  }, [refreshLeads, refreshTasks, user]);
 
   const handleAddCustomer = (newCustomer: Omit<Customer, 'id' | 'createdAt'>) => {
     const customer: Customer = {
@@ -144,29 +164,25 @@ function InternalCRMApp({ onBackToPublicSite }: { onBackToPublicSite?: () => voi
   const handleAddTask = (newTask: Omit<Task, 'id'>) => {
     const task: Task = {
       ...newTask,
-      id: `t_${Date.now()}`,
+      id: generateSecureId(),
+      createdAt: new Date().toISOString(),
     };
-    setTasks((prev) => {
-      const updated = [task, ...prev];
-      crmStorage.saveTasks(updated);
-      return updated;
-    });
+    setTasks((prev) => [task, ...prev]);
+    crmStorage.saveTaskToSupabase(task);
   };
 
   const handleToggleTask = (taskId: string) => {
-    setTasks((prev) => {
-      const updated = prev.map((t) => (t.id === taskId ? { ...t, completed: !t.completed } : t));
-      crmStorage.saveTasks(updated);
-      return updated;
-    });
+    const targetTask = tasks.find((t) => t.id === taskId);
+    const newCompleted = targetTask ? !targetTask.completed : true;
+    setTasks((prev) =>
+      prev.map((t) => (t.id === taskId ? { ...t, completed: newCompleted } : t))
+    );
+    crmStorage.toggleTaskInSupabase(taskId, newCompleted);
   };
 
   const handleDeleteTask = (taskId: string) => {
-    setTasks((prev) => {
-      const updated = prev.filter((t) => t.id !== taskId);
-      crmStorage.saveTasks(updated);
-      return updated;
-    });
+    setTasks((prev) => prev.filter((t) => t.id !== taskId));
+    crmStorage.deleteTaskFromSupabase(taskId);
   };
 
   const viewTitles: Record<ViewType, string> = {

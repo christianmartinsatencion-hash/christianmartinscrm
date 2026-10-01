@@ -51,7 +51,12 @@ export interface Task {
   dueDate: string;
   completed: boolean;
   priority: 'low' | 'medium' | 'high';
-  customerId?: string;
+  customerId?: string; // Campo legado mantido para compatibilidade
+  leadId?: string | null;
+  dealId?: string | null;
+  userId?: string;
+  createdAt?: string;
+  updatedAt?: string;
 }
 
 export type ViewType = 'dashboard' | 'customers' | 'deals' | 'tasks' | 'settings' | 'base-design';

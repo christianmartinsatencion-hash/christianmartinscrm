@@ -445,6 +445,60 @@ export interface Database {
           }
         ];
       };
+      tasks: {
+        Row: {
+          id: string;
+          user_id: string;
+          title: string;
+          due_date: string | null;
+          completed: boolean;
+          priority: 'low' | 'medium' | 'high';
+          lead_id: string | null;
+          deal_id: string | null;
+          created_at: string;
+          updated_at: string;
+        };
+        Insert: {
+          id?: string;
+          user_id?: string;
+          title: string;
+          due_date?: string | null;
+          completed?: boolean;
+          priority?: 'low' | 'medium' | 'high';
+          lead_id?: string | null;
+          deal_id?: string | null;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Update: {
+          id?: string;
+          user_id?: string;
+          title?: string;
+          due_date?: string | null;
+          completed?: boolean;
+          priority?: 'low' | 'medium' | 'high';
+          lead_id?: string | null;
+          deal_id?: string | null;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: "tasks_lead_id_fkey";
+            columns: ["lead_id"];
+            isOneToOne: false;
+            referencedRelation: "leads";
+            referencedColumns: ["id"];
+          },
+          {
+            foreignKeyName: "tasks_deal_id_fkey";
+            columns: ["deal_id"];
+            isOneToOne: false;
+            referencedRelation: "deals";
+            referencedColumns: ["id"];
+          }
+        ];
+      };
     };
     Views: {
       [_ in never]: never;
@@ -466,6 +520,9 @@ export type LeadInsert = Database['public']['Tables']['leads']['Insert'];
 export type DealRow = Database['public']['Tables']['deals']['Row'];
 export type DealInsert = Database['public']['Tables']['deals']['Insert'];
 export type DealUpdate = Database['public']['Tables']['deals']['Update'];
+export type TaskRow = Database['public']['Tables']['tasks']['Row'];
+export type TaskInsert = Database['public']['Tables']['tasks']['Insert'];
+export type TaskUpdate = Database['public']['Tables']['tasks']['Update'];
 export type PortfolioModelRow = Database['public']['Tables']['portfolio_models']['Row'];
 export type PricingPackageRow = Database['public']['Tables']['pricing_packages']['Row'];
 export type SiteSettingsRow = Database['public']['Tables']['site_settings']['Row'];
