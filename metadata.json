@@ -1,0 +1,8 @@
+{
+  "name": "Christian Martins CRM",
+  "description": "Base limpa e moderna para sistema de CRM.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
